@@ -1,157 +1,120 @@
-import os
-import hmac
-import hashlib
-import time
-import json
-import logging
-import requests
+import os, hmac, hashlib, time, logging, requests, math
 from flask import Flask, request, jsonify
 
-BINGX_API_KEY    = os.getenv("BINGX_API_KEY", "")
-BINGX_API_SECRET = os.getenv("BINGX_API_SECRET", "")
-SYMBOL           = os.getenv("SYMBOL", "BTC-USDT")
-LEVERAGE         = int(os.getenv("LEVERAGE", "5"))
-USDT_PER_TRADE   = float(os.getenv("USDT_PER_TRADE", "50"))
-WEBHOOK_SECRET   = os.getenv("WEBHOOK_SECRET", "clave123bot")
-USE_DEMO         = os.getenv("USE_DEMO", "true").lower() == "true"
+API_KEY    = os.getenv("BINGX_API_KEY", "")
+API_SECRET = os.getenv("BINGX_API_SECRET", "")
+SYMBOL     = os.getenv("SYMBOL", "BTC-USDT")
+LEVERAGE   = int(os.getenv("LEVERAGE", "5"))
+USDT       = float(os.getenv("USDT_PER_TRADE", "50"))
+SECRET     = os.getenv("WEBHOOK_SECRET", "clave123bot")
+DEMO       = os.getenv("USE_DEMO", "true").lower() == "true"
+BASE       = "https://open-api-vst.bingx.com" if DEMO else "https://open-api.bingx.com"
 
-BASE_URL = "https://open-api-vst.bingx.com" if USE_DEMO else "https://open-api.bingx.com"
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger(__name__)
 app = Flask(__name__)
 
-def _sign(params):
-    query = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
-    return hmac.new(BINGX_API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
+def sign(p):
+    q = "&".join(f"{k}={v}" for k,v in sorted(p.items()))
+    return hmac.new(API_SECRET.encode(), q.encode(), hashlib.sha256).hexdigest()
 
-def _ts():
-    return str(int(time.time() * 1000))
+def post(ep, p):
+    p["timestamp"] = str(int(time.time()*1000))
+    p["signature"] = sign(p)
+    r = requests.post(BASE+ep, headers={"X-BX-APIKEY":API_KEY}, data=p, timeout=10)
+    return r.json()
 
-def bingx_post(endpoint, params):
-    params["timestamp"] = _ts()
-    params["signature"] = _sign(params)
-    headers = {"X-BX-APIKEY": BINGX_API_KEY, "Content-Type": "application/x-www-form-urlencoded"}
-    r = requests.post(BASE_URL + endpoint, headers=headers, data=params, timeout=10)
-    r.raise_for_status()
-    result = r.json()
-    if result.get("code", 0) != 0:
-        raise Exception(f"BingX error {result.get('code')}: {result.get('msg')}")
-    return result
+def get(ep, p):
+    p["timestamp"] = str(int(time.time()*1000))
+    p["signature"] = sign(p)
+    r = requests.get(BASE+ep, headers={"X-BX-APIKEY":API_KEY}, params=p, timeout=10)
+    return r.json()
 
-def bingx_get(endpoint, params):
-    params["timestamp"] = _ts()
-    params["signature"] = _sign(params)
-    headers = {"X-BX-APIKEY": BINGX_API_KEY}
-    r = requests.get(BASE_URL + endpoint, headers=headers, params=params, timeout=10)
-    r.raise_for_status()
-    result = r.json()
-    if result.get("code", 0) != 0:
-        raise Exception(f"BingX error {result.get('code')}: {result.get('msg')}")
-    return result
+def price():
+    r = get("/openApi/swap/v2/quote/price", {"symbol":SYMBOL})
+    return float(r["data"]["price"])
 
-def set_leverage():
+def close_all():
     try:
-        bingx_post("/openApi/swap/v2/trade/leverage", {"symbol": SYMBOL, "side": "LONG", "leverage": str(LEVERAGE)})
-        bingx_post("/openApi/swap/v2/trade/leverage", {"symbol": SYMBOL, "side": "SHORT", "leverage": str(LEVERAGE)})
-        log.info(f"Leverage seteado a {LEVERAGE}x")
-    except Exception as e:
-        log.warning(f"Leverage: {e}")
-
-def get_price():
-    resp = bingx_get("/openApi/swap/v2/quote/price", {"symbol": SYMBOL})
-    return float(resp["data"]["price"])
-
-def close_positions():
-    try:
-        resp = bingx_get("/openApi/swap/v2/user/positions", {"symbol": SYMBOL})
-        for pos in resp.get("data", []):
-            size = float(pos.get("positionAmt", 0))
-            if abs(size) > 0:
-                pos_side = pos.get("positionSide", "")
-                close_side = "SELL" if pos_side == "LONG" else "BUY"
-                bingx_post("/openApi/swap/v2/trade/order", {
-                    "symbol": SYMBOL, "side": close_side,
-                    "positionSide": pos_side, "type": "MARKET", "quantity": str(abs(size))
+        r = get("/openApi/swap/v2/user/positions", {"symbol":SYMBOL})
+        for p in r.get("data", []):
+            sz = float(p.get("positionAmt", 0))
+            if abs(sz) > 0:
+                side = "SELL" if p["positionSide"]=="LONG" else "BUY"
+                post("/openApi/swap/v2/trade/order", {
+                    "symbol":SYMBOL,"side":side,
+                    "positionSide":p["positionSide"],
+                    "type":"MARKET","quantity":str(abs(sz))
                 })
-                log.info(f"Cerrada posicion {pos_side} {abs(size)}")
+                log.info(f"Cerrada {p['positionSide']} {abs(sz)}")
     except Exception as e:
-        log.error(f"Error cerrando: {e}")
+        log.error(f"close_all: {e}")
 
-def place_order(side, position_side, qty, sl, tp):
-    resp = bingx_post("/openApi/swap/v2/trade/order", {
-        "symbol": SYMBOL, "side": side,
-        "positionSide": position_side, "type": "MARKET", "quantity": str(qty)
+def open_order(side, pos_side, qty, sl, tp):
+    r = post("/openApi/swap/v2/trade/order", {
+        "symbol":SYMBOL,"side":side,"positionSide":pos_side,
+        "type":"MARKET","quantity":str(qty)
     })
-    log.info(f"Orden entrada: {resp}")
-    sl_side = "SELL" if position_side == "LONG" else "BUY"
+    log.info(f"Entrada: {r}")
+    cl = "SELL" if pos_side=="LONG" else "BUY"
     try:
-        bingx_post("/openApi/swap/v2/trade/order", {
-            "symbol": SYMBOL, "side": sl_side, "positionSide": position_side,
-            "type": "STOP_MARKET", "stopPrice": str(round(sl, 2)),
-            "closePosition": "true", "workingType": "MARK_PRICE"
+        post("/openApi/swap/v2/trade/order", {
+            "symbol":SYMBOL,"side":cl,"positionSide":pos_side,
+            "type":"STOP_MARKET","stopPrice":str(round(sl,2)),
+            "closePosition":"true","workingType":"MARK_PRICE"
         })
-        log.info(f"SL seteado en {sl}")
+        log.info(f"SL: {sl}")
     except Exception as e:
-        log.warning(f"Error SL: {e}")
+        log.warning(f"SL error: {e}")
     try:
-        bingx_post("/openApi/swap/v2/trade/order", {
-            "symbol": SYMBOL, "side": sl_side, "positionSide": position_side,
-            "type": "TAKE_PROFIT_MARKET", "stopPrice": str(round(tp, 2)),
-            "closePosition": "true", "workingType": "MARK_PRICE"
+        post("/openApi/swap/v2/trade/order", {
+            "symbol":SYMBOL,"side":cl,"positionSide":pos_side,
+            "type":"TAKE_PROFIT_MARKET","stopPrice":str(round(tp,2)),
+            "closePosition":"true","workingType":"MARK_PRICE"
         })
-        log.info(f"TP seteado en {tp}")
+        log.info(f"TP: {tp}")
     except Exception as e:
-        log.warning(f"Error TP: {e}")
-    return resp
-
-def process_signal(data):
-    if data.get("secret") != WEBHOOK_SECRET:
-        log.warning("Clave incorrecta")
-        return {"status": "error", "msg": "clave incorrecta"}
-    action = str(data.get("action", "")).upper()
-    sl = float(data.get("sl", 0))
-    tp = float(data.get("tp", 0))
-    log.info(f"Senal: action={action} sl={sl} tp={tp}")
-    if action == "CLOSE":
-        close_positions()
-        return {"status": "ok", "msg": "cerrado"}
-    if action not in ("BUY", "SELL"):
-        return {"status": "error", "msg": f"action desconocida: {action}"}
-    if sl == 0 or tp == 0:
-        return {"status": "error", "msg": "sl o tp son 0"}
-    close_positions()
-    time.sleep(0.5)
-    price = get_price()
-    min_qty = 0.001
-    import math
-    raw_qty = (USDT_PER_TRADE * LEVERAGE) / price
-    qty = math.floor(raw_qty * 1000) / 1000
-    if qty < min_qty:
-        return {"status": "error", "msg": f"cantidad {qty} menor al minimo"}
-    set_leverage()
-    side = "BUY" if action == "BUY" else "SELL"
-    position_side = "LONG" if action == "BUY" else "SHORT"
-    resp = place_order(side, position_side, qty, sl, tp)
-    return {"status": "ok", "qty": qty, "price": price}
+        log.warning(f"TP error: {e}")
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
     try:
-        data = request.get_json(force=True)
-        if not data:
-            return jsonify({"status": "error", "msg": "body vacio"}), 400
-        result = process_signal(data)
-        return jsonify(result), 200
+        d = request.get_json(force=True) or {}
+        log.info(f"Recibido: {d}")
+        if d.get("secret") != SECRET:
+            return jsonify({"error":"clave incorrecta"}), 403
+        action = str(d.get("action","")).upper()
+        sl = float(d.get("sl", 0))
+        tp = float(d.get("tp", 0))
+        if action == "CLOSE":
+            close_all()
+            return jsonify({"ok":"cerrado"})
+        if action not in ("BUY","SELL"):
+            return jsonify({"error":"action invalida"}), 400
+        close_all()
+        time.sleep(1)
+        try:
+            post("/openApi/swap/v2/trade/leverage", {"symbol":SYMBOL,"side":"LONG","leverage":str(LEVERAGE)})
+            post("/openApi/swap/v2/trade/leverage", {"symbol":SYMBOL,"side":"SHORT","leverage":str(LEVERAGE)})
+        except: pass
+        p = price()
+        qty = math.floor((USDT * LEVERAGE / p) * 1000) / 1000
+        qty = max(qty, 0.001)
+        side = "BUY" if action=="BUY" else "SELL"
+        ps   = "LONG" if action=="BUY" else "SHORT"
+        if sl == 0:
+            sl = p * (0.98 if action=="BUY" else 1.02)
+        if tp == 0:
+            tp = p * (1.03 if action=="BUY" else 0.97)
+        open_order(side, ps, qty, sl, tp)
+        return jsonify({"ok":True,"qty":qty,"price":p,"sl":sl,"tp":tp})
     except Exception as e:
         log.exception("Error webhook")
-        return jsonify({"status": "error", "msg": str(e)}), 500
+        return jsonify({"error":str(e)}), 500
 
-@app.route("/health", methods=["GET"])
+@app.route("/health")
 def health():
-    return jsonify({"status": "ok", "symbol": SYMBOL, "demo": USE_DEMO}), 200
+    return jsonify({"ok":True,"demo":DEMO,"symbol":SYMBOL})
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 8080))
-    log.info(f"Bot iniciado | Puerto:{port} | Demo:{USE_DEMO} | Par:{SYMBOL}")
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT",8080)))
